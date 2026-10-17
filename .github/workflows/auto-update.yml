@@ -101,17 +101,24 @@ jobs:
           EOF
           ls -la dist
 
-      - name: 配置 Cloudflare
+      - name: 安装 wrangler
         if: steps.check.outputs.needed == 'true'
-        uses: cloudflare/wrangler-action@v3
-        with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: npm install -g wrangler@latest --silent
 
       - name: 部署到 Cloudflare Pages
         if: steps.check.outputs.needed == 'true'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
-          npx wrangler pages deploy dist \
+          if [ -z "$CLOUDFLARE_API_TOKEN" ] || [ -z "$CLOUDFLARE_ACCOUNT_ID" ]; then
+            echo "::error::未配置 Secrets：CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID"
+            echo "请到仓库 Settings → Secrets and variables → Actions 添加"
+            exit 1
+          fi
+          # 注意：不能用 cloudflare/wrangler-action，那会跑 wrangler deploy（Workers），
+          # 会报 "Missing entry-point"。Pages 必须直接用 wrangler pages deploy。
+          wrangler pages deploy dist \
             --project-name=warpzhuanyong \
             --branch=main \
             --commit-dirty=true
