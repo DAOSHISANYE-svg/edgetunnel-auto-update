@@ -1,0 +1,140 @@
+name: edgetunnel Auto Update
+
+# edgetunnel (warpzhuanyong) 云端自动更新
+#
+# 为什么需要：你的 Pages 项目 Git Provider = No（手动上传部署），
+# 仓库更新不会自动部署。本工作流补上这一环。
+#
+# 与 CFnew 的差异：
+#   CFnew      → 有 Release，下载 Pages.zip
+#   edgetunnel  → 无 Release，直接拉 _worker.js (5.1MB)，用内容 hash 判断新旧
+
+on:
+  schedule:
+    # 每天 05:23 UTC（北京时间 13:23），与 CFnew 的 04:17 错开
+    - cron: "23 5 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "强制重新部署（忽略 hash 比对）"
+        required: false
+        default: "false"
+        type: string
+
+permissions:
+  contents: read
+  deployments: write
+
+concurrency:
+  group: edgetunnel-autoupdate
+  cancel-in-progress: false
+
+jobs:
+  update:
+    name: Check & Deploy edgetunnel
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 拉取上游最新版 _worker.js
+        id: fetch
+        run: |
+          mkdir -p upstream
+          # 实测：edgetunnel 的 Pages 入口文件是 _worker.js（约 5.1 MB）
+          #       仓库同时提供 wrangler.toml，可一并取来参考兼容日期
+          curl -sSL --retry 3 -o upstream/_worker.js \
+            https://raw.githubusercontent.com/cmliu/edgetunnel/main/_worker.js
+          test -s upstream/_worker.js || { echo "::error::下载的 _worker.js 为空"; exit 1; }
+
+          curl -sSL --retry 3 -o upstream/wrangler.toml \
+            https://raw.githubusercontent.com/cmliu/edgetunnel/main/wrangler.toml || true
+
+          SIZE=$(wc -c < upstream/_worker.js)
+          echo "size=$SIZE" >> "$GITHUB_OUTPUT"
+          echo "### 上游 _worker.js: ${SIZE} 字节" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$SIZE" -lt 100000 ]; then
+            echo "::error::文件仅 ${SIZE} 字节，明显不完整（正常约 5.1MB）"
+            exit 1
+          fi
+
+      - name: 读取上游兼容日期
+        id: compat
+        run: |
+          DATE=$(grep -oP 'compatibility_date\s*=\s*"\K[^"]+' upstream/wrangler.toml 2>/dev/null | head -1)
+          [ -z "$DATE" ] && DATE="2024-11-01"
+          echo "date=$DATE" >> "$GITHUB_OUTPUT"
+          echo "- 上游 wrangler.toml 兼容日期: $DATE" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 计算 hash 并比对
+        id: check
+        run: |
+          NEW_HASH=$(sha256sum upstream/_worker.js | cut -d' ' -f1)
+          OLD_HASH=$(cat deployed-hash.txt 2>/dev/null | tr -d '\n\r' || echo "")
+          [ -z "$OLD_HASH" ] && OLD_HASH="none"
+          echo "new=$NEW_HASH" >> "$GITHUB_OUTPUT"
+          echo "old=$OLD_HASH" >> "$GITHUB_OUTPUT"
+          echo "- 上游 hash: \`${NEW_HASH:0:16}…\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 已部署 hash: \`${OLD_HASH:0:16}…\`" >> "$GITHUB_STEP_SUMMARY"
+
+          FORCE="${{ github.event.inputs.force }}"
+          if [ "$FORCE" = "true" ] || [ "$NEW_HASH" != "$OLD_HASH" ]; then
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+            echo "### 需要更新" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+            echo "### 上游无变化，跳过" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: 准备部署目录
+        if: steps.check.outputs.needed == 'true'
+        env:
+          COMPAT_DATE: ${{ steps.compat.outputs.date }}
+        run: |
+          mkdir -p dist
+          cp upstream/_worker.js dist/_worker.js
+          cat > dist/wrangler.toml <<EOF
+          name = "warpzhuanyong"
+          compatibility_date = "$COMPAT_DATE"
+          pages_build_output_dir = "."
+          EOF
+          ls -la dist
+
+      - name: 配置 Cloudflare
+        if: steps.check.outputs.needed == 'true'
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+      - name: 部署到 Cloudflare Pages
+        if: steps.check.outputs.needed == 'true'
+        run: |
+          npx wrangler pages deploy dist \
+            --project-name=warpzhuanyong \
+            --branch=main \
+            --commit-dirty=true
+
+      - name: 记录已部署 hash
+        if: steps.check.outputs.needed == 'true'
+        run: |
+          echo "${{ steps.check.outputs.new }}" > deployed-hash.txt
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add deployed-hash.txt
+          git commit -m "chore: auto-update edgetunnel _worker.js" || true
+          git push || echo "::warning::hash 记录提交失败（不影响已部署站点）"
+
+      - name: 部署后冒烟测试
+        if: steps.check.outputs.needed == 'true'
+        run: |
+          URL="https://warpzhuanyong.pages.dev"
+          echo "### 部署后验证" >> "$GITHUB_STEP_SUMMARY"
+          sleep 20
+          CODE=$(curl -sS -o /dev/null -w "%{http_code}" "$URL" || echo "000")
+          echo "- 主地址 HTTP $CODE" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$CODE" != "200" ]; then
+            echo "::error::主地址返回 $CODE，部署可能已损坏线上服务"
+            exit 1
+          fi
