@@ -103,7 +103,7 @@ jobs:
 
       - name: 安装 wrangler
         if: steps.check.outputs.needed == 'true'
-        run: npm install -g wrangler@latest --silent
+        run: npm install -g wrangler@4 --silent
 
       - name: 部署到 Cloudflare Pages
         if: steps.check.outputs.needed == 'true'
